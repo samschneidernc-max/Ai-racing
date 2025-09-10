@@ -1,6 +1,102 @@
 import React, { useEffect, useRef, useState, useMemo } from "react";
 
 /**
+
+NeuroRacer — a tiny generational-learning racing sandbox
+
+Single-file React component. No external libs. Tailwind UI classes allowed.
+
+
+
+How it works (short):
+
+A population of cars learns to drive a fixed track using a simple neural net
+
+and a genetic algorithm (selection + crossover + mutation).
+
+Each car sees the world through 5 distance sensors (raycasts) + its speed.
+
+The network outputs steering and throttle. Fitness rewards progress along
+
+the centerline checkpoints and staying alive.
+
+When all agents crash or a time cap hits, we evolve a new generation. */
+
+export default function NeuroRacer() { // ==== UI State ==== const [running, setRunning] = useState(false); const [generation, setGeneration] = useState(1); const [populationSize, setPopulationSize] = useState(60); const [mutationRate, setMutationRate] = useState(0.12); const [elitism, setElitism] = useState(4); const [sensorCount, setSensorCount] = useState(5); const [maxSimTime, setMaxSimTime] = useState(50); // seconds const [showSensors, setShowSensors] = useState(true); const [speedLimit, setSpeedLimit] = useState(3.6); // px per frame (approx m/s vibe)
+
+const [stats, setStats] = useState({ alive: 0, best: 0, avg: 0, topLap: 0, });
+
+const canvasRef = useRef<HTMLCanvasElement | null>(null); const rafRef = useRef<number | null>(null); const simTimeRef = useRef(0);
+
+// ==== Track Definition ==== // Centerline polyline points (simple squarish loop with kinks) const track = useMemo(() => { const w = 980, h = 620; const margin = 90; const pts = [ [margin, h/2], [margin, margin], [w/2 - 120, margin], [w/2 + 160, margin + 20], [w - margin, margin + 40], [w - margin, h/2 - 60], [w - margin - 60, h - margin], [w/2 + 60, h - margin - 20], [w/2 - 220, h - margin - 40], [margin, h - margin], [margin, h/2], // close ]; const width = 120; // full track width return { pts, width, w, h }; }, []);
+
+// Build checkpoints from the centerline segments (every segment acts as a checkpoint) const checkpoints = useMemo(() => { const cps: { p: [number, number], q: [number, number], mid: [number, number] }[] = []; for (let i = 0; i < track.pts.length - 1; i++) { const p = track.pts[i] as [number, number]; const q = track.pts[i+1] as [number, number]; const mid: [number, number] = [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2]; cps.push({ p, q, mid }); } return cps; }, [track]);
+
+// ==== Math helpers ==== const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v)); const lerp = (a: number, b: number, t: number) => a + (b - a) * t; const dist2 = (ax: number, ay: number, bx: number, by: number) => (ax-bx)(ax-bx)+(ay-by)(ay-by); const segLen = (p: [number,number], q: [number,number]) => Math.hypot(q[0]-p[0], q[1]-p[1]);
+
+// Distance from point to segment; returns {d, t, projx, projy} function pointToSeg(px:number, py:number, ax:number, ay:number, bx:number, by:number) { const vx = bx - ax, vy = by - ay; const wx = px - ax, wy = py - ay; const L2 = vxvx + vyvy || 1e-9; const t = clamp((wxvx + wyvy) / L2, 0, 1); const projx = ax + tvx, projy = ay + tvy; const d = Math.hypot(px - projx, py - projy); return { d, t, projx, projy }; }
+
+// Compute distance from (x,y) to the centerline and progress along checkpoints function trackDistanceAndProgress(x:number, y:number) { let best = { d: Infinity, t: 0, seg: 0, projx: 0, projy: 0, accLen: 0 }; let acc = 0; for (let i = 0; i < track.pts.length - 1; i++) { const p = track.pts[i] as [number, number]; const q = track.pts[i+1] as [number, number]; const { d, t, projx, projy } = pointToSeg(x, y, p[0], p[1], q[0], q[1]); if (d < best.d) best = { d, t, seg: i, projx, projy, accLen: acc + segLen(p,q) * t }; acc += segLen(p,q); } const totalLen = totalTrackLenRef.current || 1; const progress = best.accLen / totalLen; // 0..1 over lap return { edgeDist: track.width/2 - best.d, segIndex: best.seg, tOnSeg: best.t, progress }; }
+
+// Raycast sensor approximation: step along a ray until outside the track bounds function senseDistance(x:number, y:number, ang:number, maxDist=220, step=6) { let d = 0; while (d < maxDist) { const sx = x + Math.cos(ang) * d; const sy = y + Math.sin(ang) * d; const { edgeDist } = trackDistanceAndProgress(sx, sy); if (edgeDist < 0) return d; // we hit outside the drivable area d += step; } return maxDist; }
+
+// ==== Neural net ==== type Genome = number[]; // flat list of weights
+
+function randn() { // small gaussian-ish // Box-Muller lite let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random(); return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v); }
+
+function randomGenome() { const input = sensorCount + 1; // sensors + speed const hidden = 8; const output = 2; // steer, throttle const W1 = (input + 1) * hidden; // +1 bias const W2 = (hidden + 1) * output; const total = W1 + W2; const g: number[] = new Array(total).fill(0).map(() => randn() * 0.7); return g; }
+
+function forward(genome: Genome, inputs: number[]) { const hidden = 8; const output = 2; const input = sensorCount + 1; // slice weights const W1 = genome.slice(0, (input + 1) * hidden); const W2 = genome.slice((input + 1) * hidden); // add bias to inputs const xin = [...inputs, 1]; // hidden activations const h: number[] = new Array(hidden).fill(0); for (let i = 0; i < hidden; i++) { let s = 0; for (let j = 0; j < input + 1; j++) s += xin[j] * W1[i*(input+1) + j]; h[i] = Math.tanh(s); } const hout = [...h, 1]; const out: number[] = new Array(output).fill(0); for (let i = 0; i < output; i++) { let s = 0; for (let j = 0; j < hidden + 1; j++) s += hout[j] * W2[i*(hidden+1) + j]; out[i] = Math.tanh(s); } // out[0]=steer (-1..1), out[1]=throttle (-1..1) return out; }
+
+function mutate(g: Genome, rate: number) { const ng = g.slice(); for (let i = 0; i < ng.length; i++) { if (Math.random() < rate) ng[i] += randn() * 0.4; } return ng; }
+
+function crossover(a: Genome, b: Genome) { const n = a.length; const child = new Array(n); const cut = Math.floor(Math.random() * n); for (let i = 0; i < n; i++) child[i] = i < cut ? a[i] : b[i]; return child as Genome; }
+
+// ==== Car & Population ==== type Car = { x: number; y: number; angle: number; vx: number; vy: number; alive: boolean; genome: Genome; fitness: number; bestProgress: number; lap: number; nextCheckpoint: number; color: string; };
+
+const carsRef = useRef<Car[]>([]); const bestGenomeRef = useRef<Genome | null>(null); const totalTrackLenRef = useRef<number>(0);
+
+function spawnPopulation(genomes?: Genome[]) { const cars: Car[] = []; const start = track.pts[0] as [number, number]; const heading = Math.atan2((track.pts[1][1]-start[1]), (track.pts[1][0]-start[0])); const pop = genomes ?? new Array(populationSize).fill(0).map(() => randomGenome()); for (let i = 0; i < pop.length; i++) { const jitter = () => (Math.random()-0.5) * 8; cars.push({ x: start[0] + jitter(), y: start[1] + jitter(), angle: heading, vx: 0, vy: 0, alive: true, genome: pop[i], fitness: 0, bestProgress: 0, lap: 0, nextCheckpoint: 0, color: hsl(${(i*47)%360} 80% 55%), }); } carsRef.current = cars; }
+
+function evolve() { const cars = carsRef.current.slice(); cars.sort((a,b) => b.fitness - a.fitness); const best = cars[0]; bestGenomeRef.current = best.genome.slice(); try { localStorage.setItem("neuroracer_best", JSON.stringify(bestGenomeRef.current)); } catch {}
+
+const survivors = cars.slice(0, Math.max(1, elitism)).map(c => c.genome); const next: Genome[] = []; survivors.forEach(s => next.push(s.slice())); function pick() { const k = 5; let bestIdx = Math.floor(Math.random()*cars.length); for (let i=1;i<k;i++) { const j = Math.floor(Math.random()*cars.length); if (cars[j].fitness > cars[bestIdx].fitness) bestIdx = j; } return cars[bestIdx].genome; } while (next.length < populationSize) { const p1 = pick(); const p2 = pick(); let child = crossover(p1, p2); child = mutate(child, mutationRate); next.push(child); } spawnPopulation(next); setGeneration(g => g + 1); simTimeRef.current = 0; }
+
+function resetAll() { setGeneration(1); simTimeRef.current = 0; bestGenomeRef.current = null; spawnPopulation(); }
+
+// ==== Simulation ==== useEffect(() => { let acc = 0; for (let i=0;i<track.pts.length-1;i++) acc += segLen(track.pts[i] as any, track.pts[i+1] as any); totalTrackLenRef.current = acc; resetAll(); }, []);
+
+useEffect(() => { resetAll(); }, [populationSize, sensorCount]);
+
+function step(dt:number) { const cars = carsRef.current; const aliveCars: Car[] = []; let bestFit = 0; let sumFit=0; let topLap=0;
+
+for (const c of cars) { if (!c.alive) { sumFit += c.fitness; continue; }
+
+const angles = [-0.8, -0.35, 0, 0.35, 0.8]; const sensors: number[] = []; for (let i=0;i<sensorCount;i++) { const rel = angles[Math.floor(i*(angles.length-1)/(sensorCount-1||1))] || 0; const d = senseDistance(c.x, c.y, c.angle + rel); sensors.push(d / 220); } const speed = Math.hypot(c.vx, c.vy); const inputs = [...sensors, speed / speedLimit]; const [steerRaw, throttleRaw] = forward(c.genome, inputs);
+
+const steer = clamp(steerRaw, -1, 1); const throttle = clamp((throttleRaw+1)/2, 0, 1);
+
+const maxSteer = 0.07; c.angle += steer * maxSteer; const acc = 0.12 * throttle; c.vx += Math.cos(c.angle) * acc; c.vy += Math.sin(c.angle) * acc;
+
+c.vx *= 0.98; c.vy *= 0.98; const spd = Math.hypot(c.vx, c.vy); if (spd > speedLimit) { const scale = speedLimit / (spd + 1e-6); c.vx *= scale; c.vy *= scale; }
+
+c.x += c.vx; c.y += c.vy;
+
+const { edgeDist, progress } = trackDistanceAndProgress(c.x, c.y); if (edgeDist < -2) { c.alive = false; }
+
+const cp = checkpoints[c.nextCheckpoint]; const dToCP = Math.hypot(c.x - cp.mid[0], c.y - cp.mid[1]); if (dToCP < 40) { c.nextCheckpoint = (c.nextCheckpoint + 1) % checkpoints.length; if (c.nextCheckpoint === 0) { c.lap += 1; c.fitness += 3.0; } else { c.fitness += 1.0; } } else { c.fitness += 0.0008; }
+
+if (c.alive) aliveCars.push(c); bestFit = Math.max(bestFit, c.fitness); topLap = Math.max(topLap, c.lap); sumFit += c.fitness; }
+
+setStats({ alive: aliveCars.length, best: bestFit, avg: sumFit / (cars.length||1), topLap });
+
+simTimeRef.current += dt; if (aliveCars.length === 0 || simTimeRef.current > maxSimTime) { evolve(); } }
+
+// ... rest of the code remains unchanged ...
+
+}import React, { useEffect, useRef, useState, useMemo } from "react";
+
+/**
  * NeuroRacer — a tiny generational-learning racing sandbox
  * Single-file React component. No external libs. Tailwind UI classes allowed.
  *
